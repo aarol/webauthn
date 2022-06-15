@@ -1,4 +1,4 @@
-module github.com/aarol/webauthn
+module github.com/duo-labs/webauthn
 
 require (
 	github.com/fxamacker/cbor/v2 v2.4.0
