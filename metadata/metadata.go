@@ -4,18 +4,42 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
+	neturl "net/url"
+	"sync"
+	"time"
 
-	"github.com/cloudflare/cfssl/revoke"
 	"github.com/google/uuid"
 	"github.com/mitchellh/mapstructure"
+	"golang.org/x/crypto/ocsp"
 
 	jwt "github.com/golang-jwt/jwt/v4"
 )
+
+// HTTPClient is an instance of http.Client that will be used for all HTTP requests.
+var HTTPClient = http.DefaultClient
+
+// HardFail determines whether the failure to check the revocation
+// status of a certificate (i.e. due to network failure) causes
+// verification to fail (a hard failure).
+var HardFail = false
+
+var ocspOpts = ocsp.RequestOptions{
+	Hash: crypto.SHA1,
+}
+
+// CRLSet associates a PKIX certificate list with the URL the CRL is
+// fetched from.
+var CRLSet = map[string]*pkix.CertificateList{}
+var crlLock = new(sync.Mutex)
 
 // Metadata is a map of authenticator AAGUIDs to corresponding metadata statements
 var Metadata = make(map[uuid.UUID]MetadataTOCPayloadEntry)
@@ -435,7 +459,7 @@ func unmarshalMDSTOC(body []byte, c http.Client) (MetadataTOCPayload, string, er
 		// create a buffer large enough to hold the certificate bytes
 		o := make([]byte, base64.StdEncoding.DecodedLen(len(chain[0].(string))))
 		// base64 decode the certificate into the buffer
-		n, err := base64.StdEncoding.Decode(o, []byte(chain[0].(string)))
+		n, _ := base64.StdEncoding.Decode(o, []byte(chain[0].(string)))
 		// parse the certificate from the buffer
 		cert, err := x509.ParseCertificate(o[:n])
 		if err != nil {
@@ -489,7 +513,7 @@ func validateChain(chain []interface{}, c http.Client) (bool, error) {
 		return false, err
 	}
 
-	if revoked, ok := revoke.VerifyCertificate(intcert); !ok {
+	if revoked, ok := VerifyCertificate(intcert); !ok {
 		return false, errCRLUnavailable
 	} else if revoked {
 		return false, errIntermediateCertRevoked
@@ -507,7 +531,7 @@ func validateChain(chain []interface{}, c http.Client) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if revoked, ok := revoke.VerifyCertificate(leafcert); !ok {
+	if revoked, ok := VerifyCertificate(leafcert); !ok {
 		return false, errCRLUnavailable
 	} else if revoked {
 		return false, errLeafCertRevoked
@@ -614,4 +638,449 @@ var (
 
 func (err *MetadataError) Error() string {
 	return err.Details
+}
+
+// VerifyCertificate ensures that the certificate passed in hasn't
+// expired and checks the CRL for the server.
+func VerifyCertificate(cert *x509.Certificate) (revoked, ok bool) {
+	revoked, ok, _ = VerifyCertificateError(cert)
+	return revoked, ok
+}
+
+// VerifyCertificateError ensures that the certificate passed in hasn't
+// expired and checks the CRL for the server.
+func VerifyCertificateError(cert *x509.Certificate) (revoked, ok bool, err error) {
+	if !time.Now().Before(cert.NotAfter) {
+		msg := fmt.Sprintf("Certificate expired %s\n", cert.NotAfter)
+		return true, true, fmt.Errorf(msg)
+	} else if !time.Now().After(cert.NotBefore) {
+		msg := fmt.Sprintf("Certificate isn't valid until %s\n", cert.NotBefore)
+		return true, true, fmt.Errorf(msg)
+	}
+	return revCheck(cert)
+}
+
+// revCheck should check the certificate for any revocations. It
+// returns a pair of booleans: the first indicates whether the certificate
+// is revoked, the second indicates whether the revocations were
+// successfully checked.. This leads to the following combinations:
+//
+//  false, false: an error was encountered while checking revocations.
+//
+//  false, true:  the certificate was checked successfully and
+//                  it is not revoked.
+//
+//  true, true:   the certificate was checked successfully and
+//                  it is revoked.
+//
+//  true, false:  failure to check revocation status causes
+//                  verification to fail
+func revCheck(cert *x509.Certificate) (revoked, ok bool, err error) {
+	for _, url := range cert.CRLDistributionPoints {
+		if ldapURL(url) {
+			continue
+		}
+
+		if revoked, ok, err := certIsRevokedCRL(cert, url); !ok {
+			if HardFail {
+				return true, false, err
+			}
+			return false, false, err
+		} else if revoked {
+			return true, true, err
+		}
+	}
+
+	if revoked, ok, err := certIsRevokedOCSP(cert, HardFail); !ok {
+		if HardFail {
+			return true, false, err
+		}
+		return false, false, err
+	} else if revoked {
+		return true, true, err
+	}
+
+	return false, true, nil
+}
+
+// We can't handle LDAP certificates, so this checks to see if the
+// URL string points to an LDAP resource so that we can ignore it.
+func ldapURL(url string) bool {
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "ldap" {
+		return true
+	}
+	return false
+}
+
+// check a cert against a specific CRL. Returns the same bool pair
+// as revCheck, plus an error if one occurred.
+func certIsRevokedCRL(cert *x509.Certificate, url string) (revoked, ok bool, err error) {
+	crlLock.Lock()
+	crl, ok := CRLSet[url]
+	if ok && crl == nil {
+		ok = false
+		delete(CRLSet, url)
+	}
+	crlLock.Unlock()
+
+	var shouldFetchCRL = true
+	if ok {
+		if !crl.HasExpired(time.Now()) {
+			shouldFetchCRL = false
+		}
+	}
+
+	issuer := getIssuer(cert)
+
+	if shouldFetchCRL {
+		var err error
+		crl, err = fetchCRL(url)
+		if err != nil {
+			return false, false, err
+		}
+
+		// check CRL signature
+		if issuer != nil {
+			err = issuer.CheckCRLSignature(crl)
+			if err != nil {
+				return false, false, err
+			}
+		}
+
+		crlLock.Lock()
+		CRLSet[url] = crl
+		crlLock.Unlock()
+	}
+
+	for _, revoked := range crl.TBSCertList.RevokedCertificates {
+		if cert.SerialNumber.Cmp(revoked.SerialNumber) == 0 {
+			return true, true, err
+		}
+	}
+
+	return false, true, err
+}
+
+func certIsRevokedOCSP(leaf *x509.Certificate, strict bool) (revoked, ok bool, e error) {
+	var err error
+
+	ocspURLs := leaf.OCSPServer
+	if len(ocspURLs) == 0 {
+		// OCSP not enabled for this certificate.
+		return false, true, nil
+	}
+
+	issuer := getIssuer(leaf)
+
+	if issuer == nil {
+		return false, false, nil
+	}
+
+	ocspRequest, err := ocsp.CreateRequest(leaf, issuer, &ocspOpts)
+	if err != nil {
+		return revoked, ok, err
+	}
+
+	for _, server := range ocspURLs {
+		resp, err := sendOCSPRequest(server, ocspRequest, leaf, issuer)
+		if err != nil {
+			if strict {
+				return revoked, ok, err
+			}
+			continue
+		}
+
+		// There wasn't an error fetching the OCSP status.
+		ok = true
+
+		if resp.Status != ocsp.Good {
+			// The certificate was revoked.
+			revoked = true
+		}
+
+		return revoked, ok, err
+	}
+	return revoked, ok, err
+}
+
+// sendOCSPRequest attempts to request an OCSP response from the
+// server. The error only indicates a failure to *fetch* the
+// certificate, and *does not* mean the certificate is valid.
+func sendOCSPRequest(server string, req []byte, leaf, issuer *x509.Certificate) (*ocsp.Response, error) {
+	var resp *http.Response
+	var err error
+	if len(req) > 256 {
+		buf := bytes.NewBuffer(req)
+		resp, err = HTTPClient.Post(server, "application/ocsp-request", buf)
+	} else {
+		reqURL := server + "/" + neturl.QueryEscape(base64.StdEncoding.EncodeToString(req))
+		resp, err = HTTPClient.Get(reqURL)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("failed to retrieve OSCP")
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case bytes.Equal(body, ocsp.UnauthorizedErrorResponse):
+		return nil, errors.New("OSCP unauthorized")
+	case bytes.Equal(body, ocsp.MalformedRequestErrorResponse):
+		return nil, errors.New("OSCP malformed")
+	case bytes.Equal(body, ocsp.InternalErrorErrorResponse):
+		return nil, errors.New("OSCP internal error")
+	case bytes.Equal(body, ocsp.TryLaterErrorResponse):
+		return nil, errors.New("OSCP try later")
+	case bytes.Equal(body, ocsp.SigRequredErrorResponse):
+		return nil, errors.New("OSCP signature required")
+	}
+
+	return ocsp.ParseResponseForCert(body, leaf, issuer)
+}
+
+func getIssuer(cert *x509.Certificate) *x509.Certificate {
+	var issuer *x509.Certificate
+	var err error
+	for _, issuingCert := range cert.IssuingCertificateURL {
+		issuer, err = fetchRemote(issuingCert)
+		if err != nil {
+			continue
+		}
+		break
+	}
+
+	return issuer
+
+}
+
+func fetchRemote(url string) (*x509.Certificate, error) {
+	resp, err := HTTPClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	in, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	p, _ := pem.Decode(in)
+	if p != nil {
+		return ParseCertificatePEM(in)
+	}
+
+	return x509.ParseCertificate(in)
+}
+
+// fetchCRL fetches and parses a CRL.
+func fetchCRL(url string) (*pkix.CertificateList, error) {
+	resp, err := HTTPClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return nil, errors.New("failed to retrieve CRL")
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCRL(body)
+}
+
+// ParseCertificatePEM parses and returns a PEM-encoded certificate,
+// can handle PEM encoded PKCS #7 structures.
+func ParseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
+	certPEM = bytes.TrimSpace(certPEM)
+	cert, rest, err := ParseOneCertificateFromPEM(certPEM)
+	if err != nil {
+		// Log the actual parsing error but throw a default parse error message.
+		return nil, errors.New("certification parse failed")
+	} else if cert == nil {
+		return nil, errors.New("certification decode failed")
+	} else if len(rest) > 0 {
+		return nil, errors.New("the PEM file should contain only one object")
+	} else if len(cert) > 1 {
+		return nil, errors.New("the PKCS7 object in the PEM file should contain only one certificate")
+	}
+	return cert[0], nil
+}
+
+// ParseOneCertificateFromPEM attempts to parse one PEM encoded certificate object,
+// either a raw x509 certificate or a PKCS #7 structure possibly containing
+// multiple certificates, from the top of certsPEM, which itself may
+// contain multiple PEM encoded certificate objects.
+func ParseOneCertificateFromPEM(certsPEM []byte) ([]*x509.Certificate, []byte, error) {
+
+	block, rest := pem.Decode(certsPEM)
+	if block == nil {
+		return nil, rest, nil
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		pkcs7data, err := ParsePKCS7(block.Bytes)
+		if err != nil {
+			return nil, rest, err
+		}
+		if pkcs7data.ContentInfo != "SignedData" {
+			return nil, rest, errors.New("only PKCS #7 Signed Data Content Info supported for certificate parsing")
+		}
+		certs := pkcs7data.Content.SignedData.Certificates
+		if certs == nil {
+			return nil, rest, errors.New("PKCS #7 structure contains no certificates")
+		}
+		return certs, rest, nil
+	}
+	var certs = []*x509.Certificate{cert}
+	return certs, rest, nil
+}
+
+// Types used for asn1 Unmarshaling.
+
+type signedData struct {
+	Version          int
+	DigestAlgorithms asn1.RawValue
+	ContentInfo      asn1.RawValue
+	Certificates     asn1.RawValue `asn1:"optional" asn1:"tag:0"`
+	Crls             asn1.RawValue `asn1:"optional"`
+	SignerInfos      asn1.RawValue
+}
+
+type initPKCS7 struct {
+	Raw         asn1.RawContent
+	ContentType asn1.ObjectIdentifier
+	Content     asn1.RawValue `asn1:"tag:0,explicit,optional"`
+}
+
+// Object identifier strings of the three implemented PKCS7 types.
+const (
+	ObjIDData          = "1.2.840.113549.1.7.1"
+	ObjIDSignedData    = "1.2.840.113549.1.7.2"
+	ObjIDEncryptedData = "1.2.840.113549.1.7.6"
+)
+
+// PKCS7 represents the ASN1 PKCS #7 Content type.  It contains one of three
+// possible types of Content objects, as denoted by the object identifier in
+// the ContentInfo field, the other two being nil.  SignedData
+// is the degenerate SignedData Content info without signature used
+// to hold certificates and crls.  Data is raw bytes, and EncryptedData
+// is as defined in PKCS #7 standard.
+type PKCS7 struct {
+	Raw         asn1.RawContent
+	ContentInfo string
+	Content     Content
+}
+
+// Content implements three of the six possible PKCS7 data types.  Only one is non-nil.
+type Content struct {
+	Data          []byte
+	SignedData    SignedData
+	EncryptedData EncryptedData
+}
+
+// SignedData defines the typical carrier of certificates and crls.
+type SignedData struct {
+	Raw          asn1.RawContent
+	Version      int
+	Certificates []*x509.Certificate
+	Crl          *pkix.CertificateList
+}
+
+// Data contains raw bytes.  Used as a subtype in PKCS12.
+type Data struct {
+	Bytes []byte
+}
+
+// EncryptedData contains encrypted data.  Used as a subtype in PKCS12.
+type EncryptedData struct {
+	Raw                  asn1.RawContent
+	Version              int
+	EncryptedContentInfo EncryptedContentInfo
+}
+
+// EncryptedContentInfo is a subtype of PKCS7EncryptedData.
+type EncryptedContentInfo struct {
+	Raw                        asn1.RawContent
+	ContentType                asn1.ObjectIdentifier
+	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedContent           []byte `asn1:"tag:0,optional"`
+}
+
+// ParsePKCS7 attempts to parse the DER encoded bytes of a
+// PKCS7 structure.
+func ParsePKCS7(raw []byte) (msg *PKCS7, err error) {
+
+	var pkcs7 initPKCS7
+	_, err = asn1.Unmarshal(raw, &pkcs7)
+	if err != nil {
+		return nil, err
+	}
+
+	msg = new(PKCS7)
+	msg.Raw = pkcs7.Raw
+	msg.ContentInfo = pkcs7.ContentType.String()
+	switch {
+	case msg.ContentInfo == ObjIDData:
+		msg.ContentInfo = "Data"
+		_, err = asn1.Unmarshal(pkcs7.Content.Bytes, &msg.Content.Data)
+		if err != nil {
+			return nil, err
+		}
+	case msg.ContentInfo == ObjIDSignedData:
+		msg.ContentInfo = "SignedData"
+		var signedData signedData
+		_, err = asn1.Unmarshal(pkcs7.Content.Bytes, &signedData)
+		if err != nil {
+			return nil, err
+		}
+		if len(signedData.Certificates.Bytes) != 0 {
+			msg.Content.SignedData.Certificates, err = x509.ParseCertificates(signedData.Certificates.Bytes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if len(signedData.Crls.Bytes) != 0 {
+			msg.Content.SignedData.Crl, err = x509.ParseDERCRL(signedData.Crls.Bytes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		msg.Content.SignedData.Version = signedData.Version
+		msg.Content.SignedData.Raw = pkcs7.Content.Bytes
+	case msg.ContentInfo == ObjIDEncryptedData:
+		msg.ContentInfo = "EncryptedData"
+		var encryptedData EncryptedData
+		_, err = asn1.Unmarshal(pkcs7.Content.Bytes, &encryptedData)
+		if err != nil {
+			return nil, err
+		}
+		if encryptedData.Version != 0 {
+			return nil, errors.New("only support for PKCS #7 encryptedData version 0")
+		}
+		msg.Content.EncryptedData = encryptedData
+
+	default:
+		return nil, errors.New("attempt to parse PKCS# 7 Content not of type data, signed data or encrypted data")
+	}
+
+	return msg, nil
+
 }
